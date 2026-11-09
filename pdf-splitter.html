@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PDF → картинки</title>
+<script src="pdf.min.js"></script>
+<script src="jszip.min.js"></script>
+<style>
+  body{ max-width:420px; margin:40px auto; padding:0 16px; font-family:sans-serif; }
+  label{ display:block; margin-top:14px; }
+  select, input{ margin-top:4px; }
+  #startBtn{ margin-top:18px; padding:6px 14px; }
+  #folderName, #fsaHint{ font-size:12px; color:#666; }
+  #progressWrap{ display:none; margin-top:12px; }
+  #status{ margin-top:12px; display:none; }
+</style>
+</head>
+<body>
+<h1>Розбити PDF на картинки</h1>
+
+<label>PDF-файл
+  <input type="file" id="fileInput" accept="application/pdf" />
+</label>
+
+<label>Папка для збереження
+  <br /><button type="button" id="pickFolderBtn">Обрати папку…</button>
+  <span id="folderName">не обрано (буде ZIP)</span>
+  <div id="fsaHint"></div>
+</label>
+
+<label>Формат
+  <select id="formatSelect">
+    <option value="png">PNG</option>
+    <option value="jpeg">JPEG</option>
+    <option value="webp">WebP</option>
+  </select>
+</label>
+
+<label>Роздільна здатність
+  <select id="scaleSelect">
+    <option value="1">1× (72 DPI)</option>
+    <option value="2" selected>2× (144 DPI)</option>
+    <option value="3">3× (216 DPI)</option>
+    <option value="4">4× (288 DPI)</option>
+  </select>
+</label>
+
+<label id="qualityField" style="display:none;">Якість (<span id="qualityValue">85</span>%)
+  <input type="range" id="qualitySlider" min="10" max="100" value="85" />
+</label>
+
+<br />
+<button id="startBtn" disabled>Розбити на сторінки</button>
+
+<div id="progressWrap">
+  <div id="progressLabel"></div>
+</div>
+
+<div id="status"></div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "pdf.worker.min.js";
+
+const fileInput = document.getElementById('fileInput');
+const pickFolderBtn = document.getElementById('pickFolderBtn');
+const folderName = document.getElementById('folderName');
+const fsaHint = document.getElementById('fsaHint');
+const formatSelect = document.getElementById('formatSelect');
+const scaleSelect = document.getElementById('scaleSelect');
+const qualityField = document.getElementById('qualityField');
+const qualitySlider = document.getElementById('qualitySlider');
+const qualityValue = document.getElementById('qualityValue');
+const startBtn = document.getElementById('startBtn');
+const progressWrap = document.getElementById('progressWrap');
+const progressLabel = document.getElementById('progressLabel');
+const statusEl = document.getElementById('status');
+
+var selectedFile = null;
+var dirHandle = null;
+const supportsFSA = typeof window.showDirectoryPicker === 'function';
+
+if (!supportsFSA) {
+  fsaHint.textContent = 'Цей браузер не підтримує пряме збереження в папку — результат буде ZIP-архівом.';
+  pickFolderBtn.disabled = true;
+}
+
+fileInput.addEventListener('change', () => {
+  selectedFile = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+  startBtn.disabled = !selectedFile;
+});
+
+pickFolderBtn.addEventListener('click', async () => {
+  try {
+    dirHandle = await window.showDirectoryPicker();
+    folderName.textContent = dirHandle.name;
+  } catch (e) {
+    if (e.name !== 'AbortError') showStatus('Не вдалося обрати папку: ' + e.message, true);
+  }
+});
+
+formatSelect.addEventListener('change', () => {
+  qualityField.style.display = formatSelect.value === 'png' ? 'none' : 'block';
+});
+
+qualitySlider.addEventListener('input', () => {
+  qualityValue.textContent = qualitySlider.value;
+});
+
+function showStatus(msg, isErr){
+  statusEl.textContent = msg;
+  statusEl.style.color = isErr ? 'crimson' : 'green';
+  statusEl.style.display = 'block';
+}
+
+function canvasToBlob(canvas, mime, quality){
+  return new Promise((resolve) => canvas.toBlob(resolve, mime, quality));
+}
+
+async function writeToDir(handle, filename, blob){
+  const fh = await handle.getFileHandle(filename, { create: true });
+  const writable = await fh.createWritable();
+  await writable.write(blob);
+  await writable.close();
+}
+
+startBtn.addEventListener('click', async () => {
+  if (!selectedFile) return;
+  startBtn.disabled = true;
+  pickFolderBtn.disabled = true;
+  progressWrap.style.display = 'block';
+  statusEl.style.display = 'none';
+
+  const format = formatSelect.value;
+  const mime = format === 'png' ? 'image/png' : format === 'jpeg' ? 'image/jpeg' : 'image/webp';
+  const ext = format === 'jpeg' ? 'jpg' : format;
+  const quality = format === 'png' ? undefined : Number(qualitySlider.value) / 100;
+  const scale = Number(scaleSelect.value);
+
+  try {
+    const arrayBuffer = await selectedFile.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    const total = pdf.numPages;
+    const padWidth = Math.max(3, String(total).length);
+
+    const zip = (!dirHandle && typeof JSZip !== 'undefined') ? new JSZip() : null;
+
+    for (let i = 1; i <= total; i++) {
+      const page = await pdf.getPage(i);
+      const viewport = page.getViewport({ scale });
+      const canvas = document.createElement('canvas');
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      const ctx = canvas.getContext('2d');
+      await page.render({ canvasContext: ctx, viewport }).promise;
+
+      const blob = await canvasToBlob(canvas, mime, quality);
+      const num = String(i).padStart(padWidth, '0');
+      const filename = `page_${num}.${ext}`;
+
+      if (dirHandle) {
+        await writeToDir(dirHandle, filename, blob);
+      } else if (zip) {
+        zip.file(filename, blob);
+      }
+
+      canvas.width = 0;
+      canvas.height = 0;
+      progressLabel.textContent = `Сторінка ${i} з ${total}`;
+    }
+
+    if (zip) {
+      progressLabel.textContent = 'Пакування у ZIP…';
+      const zipBlob = await zip.generateAsync({ type: 'blob' });
+      const baseName = selectedFile.name.replace(/\.pdf$/i, '');
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(zipBlob);
+      a.download = `${baseName}_pages.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+
+    showStatus(`Готово: ${total} сторінок (${format.toUpperCase()}).`, false);
+  } catch (e) {
+    console.error(e);
+    showStatus('Помилка: ' + e.message, true);
+  } finally {
+    startBtn.disabled = false;
+    pickFolderBtn.disabled = !supportsFSA;
+    progressWrap.style.display = 'none';
+  }
+});
+</script>
+</body>
+</html>
